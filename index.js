@@ -78,21 +78,20 @@ async function sendNotification(cfg, rule, pageTitle, matchedText) {
   }
 }
 
-async function sendSessionExpiredNotification(cfg, rule, redirectedUrl) {
-  const title = `Session expired: ${rule.label || rule.selector}`;
+async function sendSessionExpiredNotification(cfg, url, storageStatePath) {
+  const title = 'Session expired';
   const lines = [
-    `URL: ${rule.url}`,
-    `Redirected to: ${redirectedUrl}`,
-    `Run: node login.js --url ${rule.url} --out ${rule.storageStatePath}`,
+    `URL: ${url}`,
+    `Run: node login.js --url ${url} --out ${storageStatePath}`,
   ];
 
   if (cfg.notificationChannel === 'telegram') {
     if (!cfg.telegramBotToken || !cfg.telegramChatId) throw new Error('Telegram credentials not configured');
-    await sendTelegram({ botToken: cfg.telegramBotToken, chatId: cfg.telegramChatId, title, lines, url: rule.url });
+    await sendTelegram({ botToken: cfg.telegramBotToken, chatId: cfg.telegramChatId, title, lines, url });
   } else {
     if (!cfg.pushoverUserKey || !cfg.pushoverAppToken) throw new Error('Pushover credentials not configured');
-    // Use priority 1 (High) so the alert bypasses Pushover quiet hours
-    await sendPushover({ token: cfg.pushoverAppToken, user: cfg.pushoverUserKey, title, lines, url: rule.url, priority: 1 });
+    // Priority 1 (High) bypasses Pushover quiet hours — session expiry needs prompt attention
+    await sendPushover({ token: cfg.pushoverAppToken, user: cfg.pushoverUserKey, title, lines, url, priority: 1 });
   }
 }
 
@@ -112,87 +111,101 @@ function looksLikeLoginRedirect(expectedUrl, currentUrl) {
   }
 }
 
-async function monitorRule(browser, rule) {
-  const tag = rule.label || rule.selector;
+// Load the page once per cycle and evaluate every rule for that URL against it.
+async function monitorUrl(browser, url, initialRules) {
   let cfg = loadConfig();
 
-  // Each rule gets its own browser context so UA, cookies, and sessions are isolated
+  // Use the storageStatePath from the first rule that declares one for this URL
+  const storageStateRule = initialRules.find(r => r.storageStatePath);
   let storageState;
-  if (rule.storageStatePath) {
-    const fullPath = path.resolve(__dirname, rule.storageStatePath);
+  if (storageStateRule) {
+    const fullPath = path.resolve(__dirname, storageStateRule.storageStatePath);
     if (fs.existsSync(fullPath)) {
       storageState = fullPath;
     } else {
-      log(tag, `storageStatePath "${rule.storageStatePath}" not found — run: node login.js --url ${rule.url} --out ${rule.storageStatePath}`);
+      log(url, `storageStatePath "${storageStateRule.storageStatePath}" not found — run: node login.js --url ${url} --out ${storageStateRule.storageStatePath}`);
     }
   }
+
   const context = await browser.newContext({
     userAgent: cfg.userAgent || undefined,
     ...(storageState && { storageState }),
   });
   const page = await context.newPage();
 
-  log(tag, `Starting — ${rule.url}`);
+  log(url, `Starting — ${initialRules.length} rule(s)`);
 
-  let lastSentAt = 0;
+  const lastSentAt = new Map();  // ruleId -> timestamp
   let lastSessionExpiredAt = 0;
 
   while (true) {
     try {
-      // Re-read config each cycle so edits to config.json take effect without restart
       cfg = loadConfig();
 
-      // Stop this loop if the rule was disabled or removed
-      const liveRule = (cfg.rules ?? []).find(r => r.id === rule.id);
-      if (!liveRule || liveRule.enabled === false) {
-        log(tag, 'Rule disabled or removed — stopping');
+      // Pull the current live rules for this URL from the latest config
+      const liveRules = (cfg.rules ?? []).filter(r => r.enabled !== false && r.url === url);
+      if (liveRules.length === 0) {
+        log(url, 'No active rules remain for this URL — stopping');
         break;
       }
 
-      await page.goto(rule.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
-      if (rule.storageStatePath && looksLikeLoginRedirect(rule.url, page.url())) {
-        const redirectedUrl = page.url();
-        log(tag, `Session expired — redirected to ${redirectedUrl}`);
-        log(tag, `Re-authenticate: node login.js --url ${rule.url} --out ${rule.storageStatePath}`);
+      const storageStatePath = storageStateRule?.storageStatePath;
+      if (storageStatePath && looksLikeLoginRedirect(url, page.url())) {
+        const redirectedTo = page.url();
+        log(url, `Session expired — redirected to ${redirectedTo}`);
+        log(url, `Re-authenticate: node login.js --url ${url} --out ${storageStatePath}`);
 
         const cooldownMs = (cfg.dedupeIntervalSecs ?? 3600) * 1000;
         if (Date.now() - lastSessionExpiredAt >= cooldownMs) {
           try {
-            await sendSessionExpiredNotification(cfg, rule, redirectedUrl);
+            await sendSessionExpiredNotification(cfg, url, storageStatePath);
             lastSessionExpiredAt = Date.now();
-            log(tag, `Session expiry notification sent via ${cfg.notificationChannel}`);
+            log(url, `Session expiry notification sent via ${cfg.notificationChannel}`);
           } catch (err) {
-            log(tag, `Failed to send session expiry notification: ${err.message}`);
+            log(url, `Failed to send session expiry notification: ${err.message}`);
           }
         }
       } else {
-        const element = await page.$(rule.selector);
+        // Page loaded successfully — evaluate all rules against it
+        const pageTitle = await page.title();
+        const cooldownMs = (cfg.dedupeIntervalSecs ?? 3600) * 1000;
 
-        if (element) {
-          const cooldownMs = (cfg.dedupeIntervalSecs ?? 3600) * 1000;
-
-          if (Date.now() - lastSentAt < cooldownMs) {
-            log(tag, 'Match — within cooldown, skipping');
-          } else if (cfg.quietHoursEnabled && isInQuietHours(cfg.quietHoursStart ?? '22:00', cfg.quietHoursEnd ?? '07:00')) {
-            log(tag, 'Match — quiet hours active, suppressed');
-          } else {
-            const matchedText = (await element.textContent().catch(() => '')).trim();
-            const pageTitle = await page.title();
-            await sendNotification(cfg, rule, pageTitle, matchedText);
-            lastSentAt = Date.now();
-            log(tag, `Notification sent via ${cfg.notificationChannel}`);
+        for (const rule of liveRules) {
+          const tag = rule.label || rule.selector;
+          try {
+            const element = await page.$(rule.selector);
+            if (element) {
+              const ruleLastSent = lastSentAt.get(rule.id) ?? 0;
+              if (Date.now() - ruleLastSent < cooldownMs) {
+                log(tag, 'Match — within cooldown, skipping');
+              } else if (cfg.quietHoursEnabled && isInQuietHours(cfg.quietHoursStart ?? '22:00', cfg.quietHoursEnd ?? '07:00')) {
+                log(tag, 'Match — quiet hours active, suppressed');
+              } else {
+                const matchedText = (await element.textContent().catch(() => '')).trim();
+                await sendNotification(cfg, rule, pageTitle, matchedText);
+                lastSentAt.set(rule.id, Date.now());
+                log(tag, `Notification sent via ${cfg.notificationChannel}`);
+              }
+            } else {
+              log(tag, 'No match');
+            }
+          } catch (err) {
+            log(tag, `Error: ${err.message}`);
           }
-        } else {
-          log(tag, 'No match');
         }
       }
     } catch (err) {
-      log(tag, `Error: ${err.message}`);
+      log(url, `Error: ${err.message}`);
     }
 
+    // Use the shortest checkIntervalSecs among live rules for this URL
     const cfg2 = loadConfig();
-    const intervalSecs = rule.checkIntervalSecs ?? cfg2.defaultCheckIntervalSecs ?? 60;
+    const liveRules2 = (cfg2.rules ?? []).filter(r => r.enabled !== false && r.url === url);
+    const intervalSecs = liveRules2.length > 0
+      ? Math.min(...liveRules2.map(r => r.checkIntervalSecs ?? cfg2.defaultCheckIntervalSecs ?? 60))
+      : cfg2.defaultCheckIntervalSecs ?? 60;
     await sleep(intervalSecs * 1000);
   }
 
@@ -214,8 +227,15 @@ async function main() {
     process.exit(1);
   }
 
+  // Group rules by URL so each URL is fetched only once per cycle
+  const rulesByUrl = new Map();
+  for (const rule of enabledRules) {
+    if (!rulesByUrl.has(rule.url)) rulesByUrl.set(rule.url, []);
+    rulesByUrl.get(rule.url).push(rule);
+  }
+
   const browser = await chromium.launch({ headless: true });
-  console.log(`Page Notifier Daemon — ${enabledRules.length} rule(s) active`);
+  console.log(`Page Notifier Daemon — ${enabledRules.length} rule(s) across ${rulesByUrl.size} URL(s)`);
 
   const shutdown = async () => {
     console.log('\nShutting down…');
@@ -225,7 +245,7 @@ async function main() {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  await Promise.all(enabledRules.map(rule => monitorRule(browser, rule)));
+  await Promise.all([...rulesByUrl.entries()].map(([url, rules]) => monitorUrl(browser, url, rules)));
 }
 
 main().catch(err => {
