@@ -78,6 +78,24 @@ async function sendNotification(cfg, rule, pageTitle, matchedText) {
   }
 }
 
+async function sendSessionExpiredNotification(cfg, rule, redirectedUrl) {
+  const title = `Session expired: ${rule.label || rule.selector}`;
+  const lines = [
+    `URL: ${rule.url}`,
+    `Redirected to: ${redirectedUrl}`,
+    `Run: node login.js --url ${rule.url} --out ${rule.storageStatePath}`,
+  ];
+
+  if (cfg.notificationChannel === 'telegram') {
+    if (!cfg.telegramBotToken || !cfg.telegramChatId) throw new Error('Telegram credentials not configured');
+    await sendTelegram({ botToken: cfg.telegramBotToken, chatId: cfg.telegramChatId, title, lines, url: rule.url });
+  } else {
+    if (!cfg.pushoverUserKey || !cfg.pushoverAppToken) throw new Error('Pushover credentials not configured');
+    // Use priority 1 (High) so the alert bypasses Pushover quiet hours
+    await sendPushover({ token: cfg.pushoverAppToken, user: cfg.pushoverUserKey, title, lines, url: rule.url, priority: 1 });
+  }
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -117,6 +135,7 @@ async function monitorRule(browser, rule) {
   log(tag, `Starting — ${rule.url}`);
 
   let lastSentAt = 0;
+  let lastSessionExpiredAt = 0;
 
   while (true) {
     try {
@@ -133,8 +152,20 @@ async function monitorRule(browser, rule) {
       await page.goto(rule.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
       if (rule.storageStatePath && looksLikeLoginRedirect(rule.url, page.url())) {
-        log(tag, `Session expired — redirected to ${page.url()}`);
+        const redirectedUrl = page.url();
+        log(tag, `Session expired — redirected to ${redirectedUrl}`);
         log(tag, `Re-authenticate: node login.js --url ${rule.url} --out ${rule.storageStatePath}`);
+
+        const cooldownMs = (cfg.dedupeIntervalSecs ?? 3600) * 1000;
+        if (Date.now() - lastSessionExpiredAt >= cooldownMs) {
+          try {
+            await sendSessionExpiredNotification(cfg, rule, redirectedUrl);
+            lastSessionExpiredAt = Date.now();
+            log(tag, `Session expiry notification sent via ${cfg.notificationChannel}`);
+          } catch (err) {
+            log(tag, `Failed to send session expiry notification: ${err.message}`);
+          }
+        }
       } else {
         const element = await page.$(rule.selector);
 
