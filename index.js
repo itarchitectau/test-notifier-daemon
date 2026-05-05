@@ -99,6 +99,14 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function isValidUrl(url) {
+  try {
+    return new URL(url).hostname !== '';
+  } catch {
+    return false;
+  }
+}
+
 function looksLikeLoginRedirect(expectedUrl, currentUrl) {
   try {
     const expected = new URL(expectedUrl);
@@ -221,7 +229,14 @@ async function main() {
     process.exit(1);
   }
 
-  const enabledRules = (cfg.rules ?? []).filter(r => r.enabled !== false && r.url);
+  const enabledRules = (cfg.rules ?? []).filter(r => {
+    if (r.enabled === false) return false;
+    if (!isValidUrl(r.url)) {
+      console.warn(`Skipping rule "${r.label || r.selector}" — placeholder or invalid URL: "${r.url}"`);
+      return false;
+    }
+    return true;
+  });
   if (enabledRules.length === 0) {
     console.error('No enabled rules with a "url" field found in config.json.');
     process.exit(1);
