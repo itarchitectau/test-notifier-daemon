@@ -27,6 +27,7 @@
       "selector": "#error-banner",
       "checkIntervalSecs": 30,
       "priority": 1,
+      "storageStatePath": "auth/example.json",
       "enabled": false
     }
   ]

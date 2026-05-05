@@ -82,12 +82,36 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function looksLikeLoginRedirect(expectedUrl, currentUrl) {
+  try {
+    const expected = new URL(expectedUrl);
+    const current = new URL(currentUrl);
+    if (current.origin !== expected.origin) return true;
+    const p = current.pathname.toLowerCase();
+    return ['/login', '/signin', '/sign-in', '/auth', '/sso', '/saml'].some(t => p.includes(t));
+  } catch {
+    return false;
+  }
+}
+
 async function monitorRule(browser, rule) {
   const tag = rule.label || rule.selector;
   let cfg = loadConfig();
 
   // Each rule gets its own browser context so UA, cookies, and sessions are isolated
-  const context = await browser.newContext({ userAgent: cfg.userAgent || undefined });
+  let storageState;
+  if (rule.storageStatePath) {
+    const fullPath = path.resolve(__dirname, rule.storageStatePath);
+    if (fs.existsSync(fullPath)) {
+      storageState = fullPath;
+    } else {
+      log(tag, `storageStatePath "${rule.storageStatePath}" not found — run: node login.js --url ${rule.url} --out ${rule.storageStatePath}`);
+    }
+  }
+  const context = await browser.newContext({
+    userAgent: cfg.userAgent || undefined,
+    ...(storageState && { storageState }),
+  });
   const page = await context.newPage();
 
   log(tag, `Starting — ${rule.url}`);
@@ -108,24 +132,29 @@ async function monitorRule(browser, rule) {
 
       await page.goto(rule.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
-      const element = await page.$(rule.selector);
-
-      if (element) {
-        const cooldownMs = (cfg.dedupeIntervalSecs ?? 3600) * 1000;
-
-        if (Date.now() - lastSentAt < cooldownMs) {
-          log(tag, 'Match — within cooldown, skipping');
-        } else if (cfg.quietHoursEnabled && isInQuietHours(cfg.quietHoursStart ?? '22:00', cfg.quietHoursEnd ?? '07:00')) {
-          log(tag, 'Match — quiet hours active, suppressed');
-        } else {
-          const matchedText = (await element.textContent().catch(() => '')).trim();
-          const pageTitle = await page.title();
-          await sendNotification(cfg, rule, pageTitle, matchedText);
-          lastSentAt = Date.now();
-          log(tag, `Notification sent via ${cfg.notificationChannel}`);
-        }
+      if (rule.storageStatePath && looksLikeLoginRedirect(rule.url, page.url())) {
+        log(tag, `Session expired — redirected to ${page.url()}`);
+        log(tag, `Re-authenticate: node login.js --url ${rule.url} --out ${rule.storageStatePath}`);
       } else {
-        log(tag, 'No match');
+        const element = await page.$(rule.selector);
+
+        if (element) {
+          const cooldownMs = (cfg.dedupeIntervalSecs ?? 3600) * 1000;
+
+          if (Date.now() - lastSentAt < cooldownMs) {
+            log(tag, 'Match — within cooldown, skipping');
+          } else if (cfg.quietHoursEnabled && isInQuietHours(cfg.quietHoursStart ?? '22:00', cfg.quietHoursEnd ?? '07:00')) {
+            log(tag, 'Match — quiet hours active, suppressed');
+          } else {
+            const matchedText = (await element.textContent().catch(() => '')).trim();
+            const pageTitle = await page.title();
+            await sendNotification(cfg, rule, pageTitle, matchedText);
+            lastSentAt = Date.now();
+            log(tag, `Notification sent via ${cfg.notificationChannel}`);
+          }
+        } else {
+          log(tag, 'No match');
+        }
       }
     } catch (err) {
       log(tag, `Error: ${err.message}`);

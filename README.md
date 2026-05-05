@@ -65,7 +65,11 @@ Choose one channel and gather its credentials before running the daemon.
 4. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser (replace `<TOKEN>` with your token).
 5. Find `"chat":{"id": 123456}` in the response — that number is your **Chat ID**.
 
-### Step 3 — Create config.json
+### Step 3 — (Optional) Log in to protected pages
+
+If any of your monitored URLs require authentication, run `login.js` once per site before starting the daemon. See the [Authentication](#authentication) section for details.
+
+### Step 4 — Create config.json
 
 ```bash
 cp config.example.json config.json
@@ -73,7 +77,7 @@ cp config.example.json config.json
 
 Edit `config.json` with your credentials and rules (see [Configuration reference](#configuration-reference) below).
 
-### Step 4 — Run
+### Step 5 — Run
 
 ```bash
 npm start
@@ -122,7 +126,80 @@ Stop the daemon at any time with `Ctrl+C` — it shuts down cleanly and closes t
 | `priority` | `0` \| `1` \| `2` | No | Pushover notification priority (see below). Defaults to `0`. |
 | `retry` | number | No | Pushover emergency retry interval in seconds (minimum 30). Only used when `priority` is `2`. |
 | `expire` | number | No | Pushover emergency expiry in seconds (30–10800). Only used when `priority` is `2`. |
+| `storageStatePath` | string | No | Path to a saved browser session file (relative to the project folder). Used for authenticated pages — see [Authentication](#authentication). |
 | `enabled` | boolean | No | Set to `false` to skip this rule without deleting it. Defaults to `true`. |
+
+## Authentication
+
+Some pages require a login before the monitored content is accessible. The daemon handles this with a two-step pattern: you log in once interactively, the session is saved to a local file, and the daemon loads that session on every subsequent check.
+
+### How it works
+
+1. `login.js` launches a **visible** Chromium browser and navigates to the URL you specify.
+2. You complete the login process in the browser window — including any MFA, SSO, or CAPTCHA steps.
+3. Once you press Enter in the terminal, the script captures the full browser state (cookies, localStorage, sessionStorage) and saves it to a JSON file.
+4. The daemon loads that file when creating the browser context for the rule, so every page request carries the correct session tokens automatically.
+5. If the daemon detects that the page redirected to a login URL (different origin or a path containing `/login`, `/signin`, `/auth`, `/sso`, or `/saml`), it logs a warning with the exact command to re-authenticate rather than silently reporting no match.
+
+No credentials are stored in `config.json`. The session file is excluded from version control via `.gitignore`.
+
+### Running login.js
+
+```bash
+node login.js --url <page-url> --out <session-file>
+```
+
+**Example:**
+
+```bash
+node login.js --url https://app.example.com/dashboard --out auth/example.json
+```
+
+1. A browser window opens at the URL.
+2. Log in normally (fill in credentials, complete MFA, etc.).
+3. Once the dashboard is visible and you are fully authenticated, return to the terminal and press Enter.
+4. The session is saved and the browser closes.
+
+The script prints the `storageStatePath` value to add to your rule:
+
+```
+Session saved to /path/to/auth/example.json
+Add the following to your rule in config.json:
+
+  "storageStatePath": "auth/example.json"
+```
+
+### Configuring the rule
+
+Add `storageStatePath` to any rule that requires authentication:
+
+```json
+{
+  "id": "rule-2",
+  "label": "Dashboard alert",
+  "url": "https://app.example.com/dashboard",
+  "selector": "#alert-banner",
+  "checkIntervalSecs": 60,
+  "storageStatePath": "auth/example.json",
+  "enabled": true
+}
+```
+
+### Session expiry
+
+Sessions expire — corporate SSO and OAuth tokens typically last hours to days. When the daemon detects a login redirect it logs:
+
+```
+12:34:56 [Dashboard alert] Session expired — redirected to https://login.example.com/...
+12:34:56 [Dashboard alert] Re-authenticate: node login.js --url https://app.example.com/dashboard --out auth/example.json
+```
+
+Re-run the printed command, press Enter once logged in, and the daemon will pick up the refreshed session on the next check cycle — no restart needed.
+
+### Security notes
+
+- Session files contain authentication tokens. Keep them out of version control — `.gitignore` already excludes the `auth/` folder.
+- Do not share session files. Each machine should run `login.js` independently.
 
 ## Notification channels
 
@@ -217,6 +294,8 @@ All fields except `userAgent` are re-read from `config.json` on every check cycl
 | Page loads but selector never matches | The page may require user interaction or authentication. Open the URL in a browser and verify the selector is present. Some pages also require JavaScript execution to finish — try increasing the check interval to give the page more time. |
 | Telegram bot not responding | Make sure you have sent at least one message to your bot before calling `getUpdates`. Bots cannot initiate conversations — the chat ID is only available after you message them first. |
 | UA change has no effect | `userAgent` is applied when the browser context is created at startup. Restart the daemon after changing it. |
+| Session expired warning in logs | Re-run the `node login.js` command printed in the log, press Enter once logged in, then the daemon will use the refreshed session on the next cycle. |
+| `storageStatePath` not found warning | The session file doesn't exist yet. Run `node login.js --url <url> --out <path>` to create it before starting the daemon. |
 
 ## Privacy
 
