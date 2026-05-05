@@ -1,0 +1,13 @@
+{
+  "name": "page-notifier-daemon",
+  "version": "1.0.0",
+  "description": "Headless standalone daemon version of Page Element Notifier",
+  "main": "index.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "playwright": "^1.44.0"
+  }
+}
