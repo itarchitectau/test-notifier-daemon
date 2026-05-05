@@ -61,20 +61,20 @@ async function sendTelegram({ botToken, chatId, title, lines, url }) {
   if (!res.ok) throw new Error(`Telegram HTTP ${res.status}: ${await res.text()}`);
 }
 
-async function sendNotification(cfg, rule, pageTitle, matchedText) {
+async function sendNotification(cfg, rule, url, pageTitle, matchedText) {
   const title = rule.label || `Element found: ${rule.selector}`;
   const lines = [
-    `Page: ${pageTitle || rule.url}`,
+    `Page: ${pageTitle || url}`,
     matchedText ? `Text: ${matchedText.slice(0, 200)}` : null,
-    `URL: ${rule.url}`,
+    `URL: ${url}`,
   ].filter(Boolean);
 
   if (cfg.notificationChannel === 'telegram') {
     if (!cfg.telegramBotToken || !cfg.telegramChatId) throw new Error('Telegram credentials not configured');
-    await sendTelegram({ botToken: cfg.telegramBotToken, chatId: cfg.telegramChatId, title, lines, url: rule.url });
+    await sendTelegram({ botToken: cfg.telegramBotToken, chatId: cfg.telegramChatId, title, lines, url });
   } else {
     if (!cfg.pushoverUserKey || !cfg.pushoverAppToken) throw new Error('Pushover credentials not configured');
-    await sendPushover({ token: cfg.pushoverAppToken, user: cfg.pushoverUserKey, title, lines, url: rule.url, priority: rule.priority, retry: rule.retry, expire: rule.expire });
+    await sendPushover({ token: cfg.pushoverAppToken, user: cfg.pushoverUserKey, title, lines, url, priority: rule.priority, retry: rule.retry, expire: rule.expire });
   }
 }
 
@@ -119,56 +119,27 @@ function looksLikeLoginRedirect(expectedUrl, currentUrl) {
   }
 }
 
-// Load the page once per cycle and evaluate every rule for that URL against it.
-async function monitorUrl(browser, url, initialRules) {
-  let cfg = loadConfig();
-
-  // Use the storageStatePath from the first rule that declares one for this URL
-  const storageStateRule = initialRules.find(r => r.storageStatePath);
-  let storageState;
-  if (storageStateRule) {
-    const fullPath = path.resolve(__dirname, storageStateRule.storageStatePath);
-    if (fs.existsSync(fullPath)) {
-      storageState = fullPath;
-    } else {
-      log(url, `storageStatePath "${storageStateRule.storageStatePath}" not found — run: node login.js --url ${url} --out ${storageStateRule.storageStatePath}`);
-    }
-  }
-
-  const context = await browser.newContext({
-    userAgent: cfg.userAgent || undefined,
-    ...(storageState && { storageState }),
-  });
-  const page = await context.newPage();
-
-  log(url, `Starting — ${initialRules.length} rule(s)`);
-
+// Single monitoring loop: load the global URL once per cycle, evaluate all rules against it.
+async function monitor(page, url) {
   const lastSentAt = new Map();  // ruleId -> timestamp
   let lastSessionExpiredAt = 0;
 
   while (true) {
     try {
-      cfg = loadConfig();
-
-      // Pull the current live rules for this URL from the latest config
-      const liveRules = (cfg.rules ?? []).filter(r => r.enabled !== false && r.url === url);
-      if (liveRules.length === 0) {
-        log(url, 'No active rules remain for this URL — stopping');
-        break;
-      }
+      const cfg = loadConfig();
+      const liveRules = (cfg.rules ?? []).filter(r => r.enabled !== false);
 
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
 
-      const storageStatePath = storageStateRule?.storageStatePath;
-      if (storageStatePath && looksLikeLoginRedirect(url, page.url())) {
+      if (cfg.storageStatePath && looksLikeLoginRedirect(url, page.url())) {
         const redirectedTo = page.url();
         log(url, `Session expired — redirected to ${redirectedTo}`);
-        log(url, `Re-authenticate: node login.js --url ${url} --out ${storageStatePath}`);
+        log(url, `Re-authenticate: node login.js --url ${url} --out ${cfg.storageStatePath}`);
 
         const cooldownMs = (cfg.dedupeIntervalSecs ?? 3600) * 1000;
         if (Date.now() - lastSessionExpiredAt >= cooldownMs) {
           try {
-            await sendSessionExpiredNotification(cfg, url, storageStatePath);
+            await sendSessionExpiredNotification(cfg, url, cfg.storageStatePath);
             lastSessionExpiredAt = Date.now();
             log(url, `Session expiry notification sent via ${cfg.notificationChannel}`);
           } catch (err) {
@@ -176,7 +147,6 @@ async function monitorUrl(browser, url, initialRules) {
           }
         }
       } else {
-        // Page loaded successfully — evaluate all rules against it
         const pageTitle = await page.title();
         const cooldownMs = (cfg.dedupeIntervalSecs ?? 3600) * 1000;
 
@@ -192,7 +162,7 @@ async function monitorUrl(browser, url, initialRules) {
                 log(tag, 'Match — quiet hours active, suppressed');
               } else {
                 const matchedText = (await element.textContent().catch(() => '')).trim();
-                await sendNotification(cfg, rule, pageTitle, matchedText);
+                await sendNotification(cfg, rule, url, pageTitle, matchedText);
                 lastSentAt.set(rule.id, Date.now());
                 log(tag, `Notification sent via ${cfg.notificationChannel}`);
               }
@@ -208,16 +178,10 @@ async function monitorUrl(browser, url, initialRules) {
       log(url, `Error: ${err.message}`);
     }
 
-    // Use the shortest checkIntervalSecs among live rules for this URL
     const cfg2 = loadConfig();
-    const liveRules2 = (cfg2.rules ?? []).filter(r => r.enabled !== false && r.url === url);
-    const intervalSecs = liveRules2.length > 0
-      ? Math.min(...liveRules2.map(r => r.checkIntervalSecs ?? cfg2.defaultCheckIntervalSecs ?? 60))
-      : cfg2.defaultCheckIntervalSecs ?? 60;
+    const intervalSecs = cfg2.checkIntervalSecs ?? 60;
     await sleep(intervalSecs * 1000);
   }
-
-  await context.close();
 }
 
 async function main() {
@@ -229,28 +193,35 @@ async function main() {
     process.exit(1);
   }
 
-  const enabledRules = (cfg.rules ?? []).filter(r => {
-    if (r.enabled === false) return false;
-    if (!isValidUrl(r.url)) {
-      console.warn(`Skipping rule "${r.label || r.selector}" — placeholder or invalid URL: "${r.url}"`);
-      return false;
-    }
-    return true;
-  });
-  if (enabledRules.length === 0) {
-    console.error('No enabled rules with a "url" field found in config.json.');
+  if (!isValidUrl(cfg.url)) {
+    console.error(`Invalid or missing top-level "url" in config.json: "${cfg.url ?? ''}"`);
     process.exit(1);
   }
 
-  // Group rules by URL so each URL is fetched only once per cycle
-  const rulesByUrl = new Map();
-  for (const rule of enabledRules) {
-    if (!rulesByUrl.has(rule.url)) rulesByUrl.set(rule.url, []);
-    rulesByUrl.get(rule.url).push(rule);
+  const enabledRules = (cfg.rules ?? []).filter(r => r.enabled !== false);
+  if (enabledRules.length === 0) {
+    console.error('No enabled rules found in config.json.');
+    process.exit(1);
+  }
+
+  let storageState;
+  if (cfg.storageStatePath) {
+    const fullPath = path.resolve(__dirname, cfg.storageStatePath);
+    if (fs.existsSync(fullPath)) {
+      storageState = fullPath;
+    } else {
+      console.warn(`storageStatePath "${cfg.storageStatePath}" not found — run: node login.js --url ${cfg.url} --out ${cfg.storageStatePath}`);
+    }
   }
 
   const browser = await chromium.launch({ headless: true });
-  console.log(`Page Notifier Daemon — ${enabledRules.length} rule(s) across ${rulesByUrl.size} URL(s)`);
+  const context = await browser.newContext({
+    userAgent: cfg.userAgent || undefined,
+    ...(storageState && { storageState }),
+  });
+  const page = await context.newPage();
+
+  console.log(`Page Notifier Daemon — ${cfg.url} — ${enabledRules.length} rule(s)`);
 
   const shutdown = async () => {
     console.log('\nShutting down…');
@@ -260,7 +231,7 @@ async function main() {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  await Promise.all([...rulesByUrl.entries()].map(([url, rules]) => monitorUrl(browser, url, rules)));
+  await monitor(page, cfg.url);
 }
 
 main().catch(err => {

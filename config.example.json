@@ -1,11 +1,13 @@
 {
+  "url": "https://example.com/dashboard",
+  "checkIntervalSecs": 60,
+  "storageStatePath": "",
   "notificationChannel": "pushover",
   "pushoverUserKey": "",
   "pushoverAppToken": "",
   "telegramBotToken": "",
   "telegramChatId": "",
   "dedupeIntervalSecs": 3600,
-  "defaultCheckIntervalSecs": 60,
   "quietHoursEnabled": false,
   "quietHoursStart": "22:00",
   "quietHoursEnd": "07:00",
@@ -14,20 +16,15 @@
     {
       "id": "rule-1",
       "label": "Back in stock",
-      "url": "https://example.com/product",
       "selector": ".add-to-cart",
-      "checkIntervalSecs": 60,
       "priority": 0,
       "enabled": true
     },
     {
       "id": "rule-2",
       "label": "Error banner",
-      "url": "https://example.com/dashboard",
       "selector": "#error-banner",
-      "checkIntervalSecs": 30,
       "priority": 1,
-      "storageStatePath": "auth/example.json",
       "enabled": false
     }
   ]

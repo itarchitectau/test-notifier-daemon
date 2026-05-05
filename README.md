@@ -12,19 +12,21 @@ This is the standalone counterpart to the [Page Element Notifier Chrome extensio
 
 ## How it works
 
-1. You define one or more **rules** in `config.json`, each containing a URL, a CSS selector, and an optional label.
-2. The daemon launches a headless Chromium browser and opens a dedicated page per rule.
-3. Each rule runs its own independent check loop: the page is loaded, the selector is evaluated, and if a match is found a notification is sent via the configured channel (Pushover or Telegram).
-4. Notifications are rate-limited by a configurable **cooldown interval** (default 1 hour). If the element is still present after the cooldown expires, a new notification is sent automatically.
-5. Optionally configure **Quiet Hours** to suppress all notifications during a set time window (e.g. overnight).
-6. Optionally set a **User Agent** string so the page sees a different browser identity.
-7. `config.json` is re-read on every check cycle — changes take effect without restarting the daemon.
+1. You set a single **URL** and one or more **rules** in `config.json`. Each rule contains a CSS selector and an optional label.
+2. The daemon launches a headless Chromium browser and navigates to the URL on a configurable interval.
+3. On each cycle the page is loaded **once**, then every enabled rule's selector is evaluated against it in sequence.
+4. If a match is found, a notification is sent via the configured channel (Pushover or Telegram).
+5. Notifications are rate-limited by a configurable **cooldown interval** (default 1 hour). If the element is still present after the cooldown expires, a new notification is sent automatically.
+6. Optionally configure **Quiet Hours** to suppress all notifications during a set time window (e.g. overnight).
+7. Optionally set a **User Agent** string so the page sees a different browser identity.
+8. `config.json` is re-read on every check cycle — credential, cooldown, and quiet-hours changes take effect without restarting the daemon.
 
 ## Project structure
 
 ```
 test-notifier-daemon/
-├── index.js              # Daemon: browser management, monitoring loops, notifications
+├── index.js              # Daemon: browser management, monitoring loop, notifications
+├── login.js              # Interactive login helper for authenticated pages
 ├── package.json          # Dependencies (playwright only)
 └── config.example.json   # Template — copy to config.json and fill in your values
 ```
@@ -65,9 +67,9 @@ Choose one channel and gather its credentials before running the daemon.
 4. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser (replace `<TOKEN>` with your token).
 5. Find `"chat":{"id": 123456}` in the response — that number is your **Chat ID**.
 
-### Step 3 — (Optional) Log in to protected pages
+### Step 3 — (Optional) Log in to a protected page
 
-If any of your monitored URLs require authentication, run `login.js` once per site before starting the daemon. See the [Authentication](#authentication) section for details.
+If the monitored URL requires authentication, run `login.js` once before starting the daemon. See the [Authentication](#authentication) section for details.
 
 ### Step 4 — Create config.json
 
@@ -75,7 +77,7 @@ If any of your monitored URLs require authentication, run `login.js` once per si
 cp config.example.json config.json
 ```
 
-Edit `config.json` with your credentials and rules (see [Configuration reference](#configuration-reference) below).
+Edit `config.json` with your URL, credentials, and rules (see [Configuration reference](#configuration-reference) below).
 
 ### Step 5 — Run
 
@@ -86,11 +88,11 @@ npm start
 The daemon logs each check cycle to stdout with a timestamp:
 
 ```
-Page Notifier Daemon — 2 rule(s) active
-12:00:01 [Back in stock] Starting — https://example.com/product
-12:00:01 [Error banner] Starting — https://example.com/dashboard
+Page Notifier Daemon — https://example.com/dashboard — 2 rule(s)
 12:00:04 [Back in stock] No match
-12:00:05 [Error banner] No match
+12:00:04 [Error banner] No match
+12:01:04 [Back in stock] Match — within cooldown, skipping
+12:01:04 [Error banner] No match
 ```
 
 Stop the daemon at any time with `Ctrl+C` — it shuts down cleanly and closes the browser.
@@ -101,17 +103,19 @@ Stop the daemon at any time with `Ctrl+C` — it shuts down cleanly and closes t
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `url` | string | — | **Required.** The page URL to monitor. |
+| `checkIntervalSecs` | number | `60` | How often to reload and check the page (seconds) |
+| `storageStatePath` | string | `""` | Path to a saved browser session file for authenticated pages — see [Authentication](#authentication) |
 | `notificationChannel` | `"pushover"` \| `"telegram"` | `"pushover"` | Which channel to send notifications through |
 | `pushoverUserKey` | string | — | Pushover user key |
 | `pushoverAppToken` | string | — | Pushover application token |
 | `telegramBotToken` | string | — | Telegram bot token |
 | `telegramChatId` | string | — | Telegram chat ID |
 | `dedupeIntervalSecs` | number | `3600` | Cooldown between repeat notifications for the same rule (seconds) |
-| `defaultCheckIntervalSecs` | number | `60` | How often to reload and check each page, used when a rule does not set its own `checkIntervalSecs` |
 | `quietHoursEnabled` | boolean | `false` | Whether to suppress notifications during the quiet window |
 | `quietHoursStart` | `"HH:MM"` | `"22:00"` | Start of the quiet window (local time) |
 | `quietHoursEnd` | `"HH:MM"` | `"07:00"` | End of the quiet window (local time) |
-| `userAgent` | string | `""` | Custom User-Agent string sent with every page request. Leave empty to use the Chromium default. |
+| `userAgent` | string | `""` | Custom User-Agent string. Leave empty to use the Chromium default. |
 | `rules` | array | `[]` | List of monitoring rules (see below) |
 
 ### Rule fields
@@ -119,14 +123,11 @@ Stop the daemon at any time with `Ctrl+C` — it shuts down cleanly and closes t
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `id` | string | Yes | Unique identifier for the rule |
-| `url` | string | Yes | Page URL to monitor |
 | `selector` | string | Yes | CSS selector to watch for |
 | `label` | string | No | Friendly name shown in the notification title |
-| `checkIntervalSecs` | number | No | How often to reload this page (seconds). Falls back to `defaultCheckIntervalSecs`. |
 | `priority` | `0` \| `1` \| `2` | No | Pushover notification priority (see below). Defaults to `0`. |
 | `retry` | number | No | Pushover emergency retry interval in seconds (minimum 30). Only used when `priority` is `2`. |
 | `expire` | number | No | Pushover emergency expiry in seconds (30–10800). Only used when `priority` is `2`. |
-| `storageStatePath` | string | No | Path to a saved browser session file (relative to the project folder). Used for authenticated pages — see [Authentication](#authentication). |
 | `enabled` | boolean | No | Set to `false` to skip this rule without deleting it. Defaults to `true`. |
 
 ## Authentication
@@ -138,8 +139,8 @@ Some pages require a login before the monitored content is accessible. The daemo
 1. `login.js` launches a **visible** Chromium browser and navigates to the URL you specify.
 2. You complete the login process in the browser window — including any MFA, SSO, or CAPTCHA steps.
 3. Once you press Enter in the terminal, the script captures the full browser state (cookies, localStorage, sessionStorage) and saves it to a JSON file.
-4. The daemon loads that file when creating the browser context for the rule, so every page request carries the correct session tokens automatically.
-5. If the daemon detects that the page redirected to a login URL (different origin or a path containing `/login`, `/signin`, `/auth`, `/sso`, or `/saml`), it logs a warning with the exact command to re-authenticate rather than silently reporting no match.
+4. The daemon loads that file when creating the browser context, so every page request carries the correct session tokens automatically.
+5. If the daemon detects that the page redirected to a login URL (different origin or a path containing `/login`, `/signin`, `/auth`, `/sso`, or `/saml`), it logs a warning and sends a session expiry notification.
 
 No credentials are stored in `config.json`. The session file is excluded from version control via `.gitignore`.
 
@@ -160,7 +161,7 @@ node login.js --url https://app.example.com/dashboard --out auth/example.json
 3. Once the dashboard is visible and you are fully authenticated, return to the terminal and press Enter.
 4. The session is saved and the browser closes.
 
-The script prints the `storageStatePath` value to add to your rule:
+The script prints the `storageStatePath` value to set in `config.json`:
 
 ```
 Session saved to /path/to/auth/example.json
@@ -169,29 +170,25 @@ Add the following to your rule in config.json:
   "storageStatePath": "auth/example.json"
 ```
 
-### Configuring the rule
+### Configuring authentication
 
-Add `storageStatePath` to any rule that requires authentication:
+Set `storageStatePath` at the top level of `config.json`:
 
 ```json
 {
-  "id": "rule-2",
-  "label": "Dashboard alert",
   "url": "https://app.example.com/dashboard",
-  "selector": "#alert-banner",
-  "checkIntervalSecs": 60,
   "storageStatePath": "auth/example.json",
-  "enabled": true
+  ...
 }
 ```
 
 ### Session expiry
 
-Sessions expire — corporate SSO and OAuth tokens typically last hours to days. When the daemon detects a login redirect it logs:
+Sessions expire — corporate SSO and OAuth tokens typically last hours to days. When the daemon detects a login redirect it logs and sends a notification:
 
 ```
-12:34:56 [Dashboard alert] Session expired — redirected to https://login.example.com/...
-12:34:56 [Dashboard alert] Re-authenticate: node login.js --url https://app.example.com/dashboard --out auth/example.json
+12:34:56 [https://app.example.com/dashboard] Session expired — redirected to https://login.example.com/...
+12:34:56 [https://app.example.com/dashboard] Re-authenticate: node login.js --url https://app.example.com/dashboard --out auth/example.json
 ```
 
 Re-run the printed command, press Enter once logged in, and the daemon will pick up the refreshed session on the next check cycle — no restart needed.
@@ -259,41 +256,43 @@ A notification suppressed by quiet hours does **not** reset the cooldown timer.
 
 Set `userAgent` in `config.json` to send a custom `User-Agent` header with every page request. This affects both the HTTP request header and `navigator.userAgent` as seen by client-side JavaScript, because Playwright sets the UA at the browser context level.
 
-The override applies to all rules. To disable it, set `userAgent` to an empty string.
+To disable it, set `userAgent` to an empty string.
 
-**Note:** The UA is read once when a rule's browser context is created (at daemon startup). Changing `userAgent` in `config.json` while the daemon is running requires a restart to take effect.
+**Note:** `userAgent` is applied when the browser context is created at startup. Changing it requires a restart.
 
 ## Config hot-reload
 
-All fields except `userAgent` are re-read from `config.json` on every check cycle. This means you can:
+Most fields are re-read from `config.json` on every check cycle:
 
-- Change credentials, cooldown, or quiet hours without restarting
-- Disable a rule by setting `"enabled": false` — the daemon stops its loop on the next cycle
-- Add new rules — **new rules require a restart** because their monitoring loops are started only at launch
+- Credential, cooldown, and quiet-hours changes take effect immediately
+- Disabling a rule (`"enabled": false`) takes effect on the next cycle
+- Adding new rules requires a restart
+- Changing `url`, `storageStatePath`, or `userAgent` requires a restart (they are applied at startup)
 
 ## Differences from the Chrome extension
 
 | Feature | Chrome extension | Daemon |
 |---|---|---|
-| URL to monitor | Any open browser tab | Explicit `url` field per rule |
+| URL to monitor | Any open browser tab | Single global `url` in config |
 | DOM watching | `MutationObserver` (real-time) | Periodic page reload |
 | Config storage | `chrome.storage.sync` (syncs across devices) | Local `config.json` file |
 | Cooldown persistence | Survives browser restart | Resets on daemon restart |
 | User Agent | HTTP header + JS override | Browser context (covers both automatically) |
 | UI | Popup and options page | Edit `config.json` directly |
-| Auto-refresh | Per-tab, configured in popup | `checkIntervalSecs` per rule |
+| Auto-refresh | Per-tab, configured in popup | Global `checkIntervalSecs` |
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---|---|
 | `Cannot read config.json` | Copy `config.example.json` to `config.json` and fill in your values. |
+| `Invalid or missing top-level "url"` | Set a valid URL (e.g. `"https://example.com/dashboard"`) as the top-level `url` field in `config.json`. |
 | No notification received | Check that the correct `notificationChannel` is set and its credentials are filled in. Confirm the selector matches by testing it in a browser's DevTools console: `document.querySelector('your-selector')`. |
-| Daemon exits immediately | Ensure at least one rule has both `"enabled": true` and a `"url"` field. |
+| Daemon exits immediately | Ensure `url` is set and at least one rule has `"enabled": true`. |
 | Notifications stop after first | Check `dedupeIntervalSecs` — the default is 3600 s (1 hour). Lower it for more frequent alerts. |
-| Page loads but selector never matches | The page may require user interaction or authentication. Open the URL in a browser and verify the selector is present. Some pages also require JavaScript execution to finish — try increasing the check interval to give the page more time. |
+| Page loads but selector never matches | The page may require user interaction or authentication. Open the URL in a browser and verify the selector is present. |
 | Telegram bot not responding | Make sure you have sent at least one message to your bot before calling `getUpdates`. Bots cannot initiate conversations — the chat ID is only available after you message them first. |
-| UA change has no effect | `userAgent` is applied when the browser context is created at startup. Restart the daemon after changing it. |
+| UA change has no effect | `userAgent` is applied at startup. Restart the daemon after changing it. |
 | Session expired warning in logs | Re-run the `node login.js` command printed in the log, press Enter once logged in, then the daemon will use the refreshed session on the next cycle. |
 | `storageStatePath` not found warning | The session file doesn't exist yet. Run `node login.js --url <url> --out <path>` to create it before starting the daemon. |
 
